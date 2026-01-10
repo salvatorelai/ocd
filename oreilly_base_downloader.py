@@ -46,9 +46,10 @@ class OReillyDownloader:
     LOGIN_URL = f"{BASE_URL}/accounts/login/"
     SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
     
-    def __init__(self, email, password, download_dir="downloads", transcript_only=False, headless=True):
+    def __init__(self, email, password, download_dir="downloads", transcript_only=False, headless=True, cookie_file=None):
         self.email = email
         self.password = password
+        self.cookie_file = cookie_file
         self.download_dir = Path(download_dir)
         self.download_dir.mkdir(exist_ok=True)
         self.progress_file = Path("download_progress.json")
@@ -121,8 +122,10 @@ class OReillyDownloader:
         
     def _is_logged_in(self):
         """Check if already logged in"""
-        current_url = self.driver.current_url
-        return "login" not in current_url.lower() and "signin" not in current_url.lower()
+        current_url = self.driver.current_url.lower()
+        if "start-trial" in current_url or "pricing" in current_url:
+            return False
+        return "login" not in current_url and "signin" not in current_url
     
     def _perform_login_steps(self):
         """Perform the two-step login process"""
@@ -158,6 +161,58 @@ class OReillyDownloader:
         print("  ✓ Clicked sign in button")
         time.sleep(5)
     
+        
+    def _load_cookies(self):
+        """Load cookies from JSON file and inject into driver"""
+        if not self.cookie_file or not os.path.exists(self.cookie_file):
+            return False
+            
+        print(f"🍪 Loading cookies from {self.cookie_file}...")
+        try:
+            with open(self.cookie_file, 'r') as f:
+                cookies = json.load(f)
+            
+            # Handle different formats
+            if isinstance(cookies, dict):
+                # Old format: {name: value}
+                print("⚠️  Legacy cookie format detected. Regenerating cookies is recommended.")
+                cookie_list = []
+                for k, v in cookies.items():
+                    cookie_list.append({
+                        'name': k, 
+                        'value': v, 
+                        'domain': '.oreilly.com'
+                    })
+            else:
+                # New format: list of dicts
+                cookie_list = cookies
+            
+            count = 0
+            for cookie in cookie_list:
+                try:
+                    # Ensure domain is set for legacy cookies
+                    if 'domain' not in cookie:
+                        cookie['domain'] = '.oreilly.com'
+                        
+                    self.driver.add_cookie(cookie)
+                    count += 1
+                except Exception:
+                    # Try without domain if it fails (e.g. domain mismatch)
+                    try:
+                        if 'domain' in cookie:
+                            c_copy = cookie.copy()
+                            del c_copy['domain']
+                            self.driver.add_cookie(c_copy)
+                            count += 1
+                    except Exception:
+                        pass
+                        
+            print(f"  ✓ Loaded {count} cookies")
+            return True
+        except Exception as e:
+            print(f"❌ Error loading cookies: {e}")
+            return False
+
     def login(self):
         """Login to O'Reilly"""
         print("\n🔐 Checking O'Reilly login status...")
@@ -166,13 +221,32 @@ class OReillyDownloader:
         self.driver.get(self.BASE_URL)
         time.sleep(3)
         
-        # Check if already logged in
+        # Check if already logged in (persistent profile)
         if self._is_logged_in():
             print("✓ Already logged in! (Using saved profile)")
-            print("✓ No need to enter credentials again!")
             return True
+            
+        # Try cookie login if file provided
+        if self.cookie_file:
+            if self._load_cookies():
+                print("  Refreshing page to apply cookies...")
+                self.driver.refresh()
+                time.sleep(3)
+                if self._is_logged_in():
+                    print("✓ Cookie login successful!")
+                    return True
+                else:
+                    print("⚠️ Cookie login failed/expired. Falling back to credentials...")
         
-        # Need to login
+        # Fallback to standard login if credentials provided
+        if not self.email or not self.password:
+            if self.cookie_file:
+                print("❌ Cookie login failed and no credentials provided.")
+            else:
+                print("❌ No credentials or cookie file provided.")
+            return False
+
+        # Need to login with credentials
         print("  Need to perform login...")
         self.driver.get(self.LOGIN_URL)
         time.sleep(3)
@@ -183,7 +257,7 @@ class OReillyDownloader:
             # Verify login success
             if self._is_logged_in():
                 print("✓ Login successful!")
-                print("✓ Login saved to Chrome profile - won't need to login again!")
+                print("✓ Login saved to Chrome profile")
                 return True
             else:
                 print("❌ Login failed! Check credentials")
@@ -257,15 +331,18 @@ class OReillyDownloader:
         except:
             return []
     
-    def capture_video_url(self, video_url, timeout=45):
+    def capture_video_url(self, video_url, timeout=45, reload_page=True):
         """Navigate to video page and capture m3u8 URL"""
         print(f"\n📹 Processing: {video_url}")
         
         try:
-            # Navigate to video page
-            self.driver.get(video_url)
-            print("  ✓ Page loaded")
-            time.sleep(5)
+            # Navigate to video page only if needed
+            if reload_page:
+                self.driver.get(video_url)
+                print("  ✓ Page loaded")
+                time.sleep(5)
+            else:
+                print("  ✓ Using current page (no reload)")
             
             # Inject URL capturer before video plays
             self._inject_url_capturer()
@@ -541,9 +618,14 @@ class OReillyDownloader:
         print("\n" + "=" * 80)
         
         # Navigate to video page
-        self.driver.get(video_url)
-        print(f"\n📹 Processing: {video_url}")
-        time.sleep(5)
+        # Check if we need to reload the page (only if different from current)
+        current_url = self.driver.current_url
+        if video_url not in current_url:
+            self.driver.get(video_url)
+            print(f"\n📹 Processing: {video_url}")
+            time.sleep(5)
+        else:
+            print(f"\n📹 Processing: {video_url} (Already on page)")
         
         # Get video title while on video page
         title = self.get_video_title()
@@ -579,7 +661,8 @@ class OReillyDownloader:
                 result['error'] = 'No transcript found'
         else:
             # Full download mode: capture video URL and download
-            m3u8_url = self.capture_video_url(video_url)
+            # Pass existing title to avoid reloading
+            m3u8_url = self.capture_video_url(video_url, reload_page=False)
             
             if not m3u8_url:
                 result['error'] = 'Failed to capture m3u8 URL'

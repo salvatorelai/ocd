@@ -31,7 +31,25 @@ choco install ffmpeg  # Windows
 
 ### Usage
 
-#### One Simple Command to Download Complete Course
+#### Cookie Login (Recommended) 🍪
+
+Avoid entering your password by using browser cookies:
+
+1. **Install helper**: `pip install browser-cookie3`
+2. **Login in Browser**: Login to O'Reilly in Chrome or Firefox.
+3. **Generate Cookies**:
+   ```bash
+   python generate_cookies.py
+   ```
+4. **Run Downloader**:
+   ```bash
+   python oreilly_course_downloader.py \
+     --url "https://learning.oreilly.com/course/..." \
+     --cookie-file "cookies.json"
+   ```
+
+#### Login with Password
+
 
 ```bash
 # Download complete course (videos + transcripts)

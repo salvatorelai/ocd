@@ -19,7 +19,7 @@ from selenium.webdriver.common.by import By
 # Constants
 PROFILE_DIR = Path("chrome_profile")
 DEFAULT_COURSE_NAME = "O'Reilly Course"
-COURSE_URL_PATTERN = r'/course/([^/]+)/'
+COURSE_URL_PATTERN = r'/(?:course|videos)/([^/]+)/'
 
 
 class OReillyCourseDownloader(OReillyDownloader):
@@ -28,14 +28,15 @@ class OReillyCourseDownloader(OReillyDownloader):
     Inherits from OReillyDownloader and adds course structure extraction.
     """
     
-    def __init__(self, email=None, password=None, transcript_only=False, headless=True):
+    def __init__(self, email=None, password=None, transcript_only=False, headless=True, cookie_file=None):
         # Email and password are optional if Chrome profile already has saved login
         super().__init__(
             email=email or "",
             password=password or "",
             download_dir="downloads",
             transcript_only=transcript_only,
-            headless=headless
+            headless=headless,
+            cookie_file=cookie_file
         )
         self.course_structure = None
         self.course_name = None
@@ -240,7 +241,7 @@ class OReillyCourseDownloader(OReillyDownloader):
         print("=" * 80)
 
 
-def extract_course_structure_from_url(course_url, output_file="course_structure.json", headless=True):
+def extract_course_structure_from_url(course_url, output_file="course_structure.json", headless=True, cookie_file=None):
     """Extract course structure by expanding sections and parsing DOM"""
     print("=" * 80)
     print("🔍 COURSE STRUCTURE EXTRACTOR")
@@ -248,20 +249,15 @@ def extract_course_structure_from_url(course_url, output_file="course_structure.
     print(f"\n📚 Course URL: {course_url}")
     print(f"📄 Output file: {output_file}\n")
     
-    extractor = OReillyCourseDownloader(headless=headless)
+    extractor = OReillyCourseDownloader(headless=headless, cookie_file=cookie_file)
     
     try:
         extractor.setup_driver()
         
         # Login
-        extractor.driver.get(extractor.BASE_URL)
-        time.sleep(3)
-        
-        if "Sign In" not in extractor.driver.page_source:
-            print("✓ Already logged in!\n")
-        else:
-            print("🔐 Logging in...\n")
-            extractor.login()
+        if not extractor.login():
+            print("❌ Login failed during extraction! Cannot proceed.")
+            return
         
         # Navigate to course page
         print(f"📖 Opening course page...")
@@ -332,7 +328,7 @@ def _get_extraction_script():
         }
         
         // Find all video links
-        const allVideoLinks = document.querySelectorAll('a[href*="/videos/"][href*="/9780"]');
+        const allVideoLinks = document.querySelectorAll('a[href*="/videos/"]');
         
         // Extract structured data
         const courseStructure = [];
@@ -508,6 +504,11 @@ Examples:
         help='O\'Reilly account password (only required for first-time login, saved in Chrome profile)'
     )
     parser.add_argument(
+        '--cookie-file',
+        type=str,
+        help='Path to cookies.json file (alternative to email/password)'
+    )
+    parser.add_argument(
         '--transcript-only',
         action='store_true',
         help='Only download transcripts, skip video files'
@@ -528,17 +529,26 @@ Examples:
     return parser.parse_args()
 def _validate_first_time_login(args):
     """Validate credentials for first-time login"""
+    # Allow if cookie file is provided
+    if args.cookie_file and Path(args.cookie_file).exists():
+        print(f"✓ Using cookies from {args.cookie_file}")
+        return True
+
     if not _is_profile_exists() and (not args.email or not args.password):
         print("=" * 80)
         print("❌ FIRST-TIME LOGIN REQUIRED")
         print("=" * 80)
-        print("\n📧 Email and password are required for first-time login.")
+        print("\n📧 Email and password OR cookie file are required for first-time login.")
         print("After successful login, credentials will be saved in Chrome profile.")
         print("\nUsage:")
         print('  python oreilly_course_downloader.py \\')
         print('    --url "COURSE_URL" \\')
         print('    --email "your@email.com" \\')
         print('    --password "yourpassword"')
+        print("\nOR using cookies:")
+        print('  python oreilly_course_downloader.py \\')
+        print('    --url "COURSE_URL" \\')
+        print('    --cookie-file "cookies.json"')
         print("\n💡 Next time you won't need to provide credentials!")
         print("=" * 80)
         return False
@@ -562,6 +572,21 @@ def main():
     
     # Main workflow: Extract + Download in one go
     if args.url:
+        # Normalize URL: if video URL provided, convert to course URL for better extraction
+        # e.g. /videos/slug/id/video_id/ -> /course/slug/id/
+        if '/videos/' in args.url:
+            try:
+                # Regex to capture slug and id
+                match = re.search(r'/videos/([^/]+)/([^/]+)/', args.url)
+                if match:
+                    new_url = f"https://learning.oreilly.com/course/{match.group(1)}/{match.group(2)}/"
+                    print(f"ℹ️  Converted video URL to course URL for better extraction:")
+                    print(f"   Original: {args.url}")
+                    print(f"   Target:   {new_url}")
+                    args.url = new_url
+            except Exception as e:
+                print(f"⚠️  Could not normalize URL: {e}")
+
         print("=" * 80)
         print("🎓 O'REILLY COURSE DOWNLOADER - ONE-STEP WORKFLOW")
         print("=" * 80)
@@ -582,7 +607,7 @@ def main():
         print("⏳ This may take 10-30 seconds...")
         
         try:
-            extract_course_structure_from_url(args.url, structure_file, headless=args.headless)
+            extract_course_structure_from_url(args.url, structure_file, headless=args.headless, cookie_file=args.cookie_file)
         except Exception as e:
             print(f"\n❌ Failed to extract course structure: {e}")
             print("Please check the course URL and try again.")
@@ -598,7 +623,8 @@ def main():
                 email=args.email,
                 password=args.password,
                 transcript_only=args.transcript_only,
-                headless=args.headless
+                headless=args.headless,
+                cookie_file=args.cookie_file
             )
             downloader.download_course(
                 course_structure_file=structure_file,
