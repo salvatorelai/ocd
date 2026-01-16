@@ -28,7 +28,7 @@ class OReillyCourseDownloader(OReillyDownloader):
     Inherits from OReillyDownloader and adds course structure extraction.
     """
     
-    def __init__(self, email=None, password=None, transcript_only=False, headless=True, cookie_file=None):
+    def __init__(self, email=None, password=None, transcript_only=False, headless=True, cookie_file=None, no_transcript=False):
         # Email and password are optional if Chrome profile already has saved login
         super().__init__(
             email=email or "",
@@ -36,7 +36,8 @@ class OReillyCourseDownloader(OReillyDownloader):
             download_dir="downloads",
             transcript_only=transcript_only,
             headless=headless,
-            cookie_file=cookie_file
+            cookie_file=cookie_file,
+            no_transcript=no_transcript
         )
         self.course_structure = None
         self.course_name = None
@@ -114,7 +115,7 @@ class OReillyCourseDownloader(OReillyDownloader):
             original_download_dir = self.download_dir
             self.download_dir = lesson_folder
             
-            result = self.process_single_video(video_url)
+            result = self.process_single_video(video_url, title=video_title)
             
             # Restore original download directory
             self.download_dir = original_download_dir
@@ -206,16 +207,17 @@ class OReillyCourseDownloader(OReillyDownloader):
                 # Process each video
                 for video_item in videos:
                     video_url = video_item['url']
-                    video_title = video_item['title']
+                    original_title = video_item['title']
                     
                     # Skip quizzes and continue links
                     is_quiz, _ = self._should_skip_item(video_url, "")
                     if is_quiz:
-                        print(f"    ⏭️  Skipping: {video_title} (quiz/continue link)")
+                        print(f"    ⏭️  Skipping: {original_title} (quiz/continue link)")
                         stats['skipped'] += 1
                         continue
                     
                     video_count += 1
+                    video_title = f"{video_count:02d} - {self.sanitize_filename(original_title)}"
                     print(f"\n    🎥 Video {video_count}: {video_title}")
                     
                     # Download video
@@ -345,22 +347,49 @@ def _get_extraction_script():
             let lessonFound = false;
             
             // Walk up the DOM tree to find section headers
-            for (let i = 0; i < 10 && tempParent; i++) {
+            for (let i = 0; i < 20 && tempParent; i++) {
                 const prevElements = Array.from(tempParent.parentElement?.children || []);
                 const currentIndex = prevElements.indexOf(tempParent);
                 
                 for (let j = currentIndex - 1; j >= 0; j--) {
                     const elem = prevElements[j];
-                    const heading = elem.querySelector('h2, h3, h4, h5') || 
-                                   (elem.tagName.match(/H[2-5]/) ? elem : null);
+                    
+                    // Enhanced header detection
+                    // Look for standard headings, ARIA headings, or elements with specific classes
+                    const heading = elem.querySelector('h1, h2, h3, h4, h5, h6, [role="heading"], .chapter-title, .module-title, .section-title, .t-chapter-title') || 
+                                   (elem.tagName.match(/H[1-6]/) ? elem : null) ||
+                                   (elem.getAttribute('role') === 'heading' ? elem : null);
                     
                     if (heading) {
                         const headingText = cleanName(heading.textContent.trim());
+                        if (!headingText) continue;
                         
-                        if (headingText.toLowerCase().includes('module') && !moduleFound) {
-                            currentModule = headingText;
+                        // Check for common keywords in hierarchy
+                        // Most O'Reilly courses use "Chapter", "Module", "Section" or just numbered headers
+                        
+                        const isModuleLike = /^(Module|Chapter|Section|Part)\s*\d+/i.test(headingText) ||
+                                           headingText.toLowerCase().includes('module') ||
+                                           headingText.toLowerCase().includes('chapter') ||
+                                           headingText.toLowerCase().includes('section') ||
+                                           headingText.toLowerCase().includes('part');
+                                           
+                        if (isModuleLike && !moduleFound) {
+                            if (currentModule !== headingText) {
+                                currentModule = headingText;
+                                // Reset lesson when module changes to avoid carry-over from previous module
+                                currentLesson = headingText;
+                            }
                             moduleFound = true;
-                        } else if (headingText.toLowerCase().includes('lesson') && !lessonFound) {
+                        } else if (!moduleFound && !lessonFound) {
+                            // If we haven't found a module yet, and this is a heading, treat it as Module
+                            // This covers cases where headers don't have "Chapter X" prefix but are top-level
+                            if (currentModule !== headingText) {
+                                currentModule = headingText;
+                                // Reset lesson when module changes
+                                currentLesson = headingText;
+                            }
+                            moduleFound = true;
+                        } else if (!lessonFound && headingText !== currentModule && !moduleFound) {
                             currentLesson = headingText;
                             lessonFound = true;
                         }
@@ -509,9 +538,19 @@ Examples:
         help='Path to cookies.json file (alternative to email/password)'
     )
     parser.add_argument(
+        '--single-video',
+        action='store_true',
+        help='Download only the single video provided in URL (do not convert to course)'
+    )
+    parser.add_argument(
         '--transcript-only',
         action='store_true',
         help='Only download transcripts, skip video files'
+    )
+    parser.add_argument(
+        '--no-transcript',
+        action='store_true',
+        help='Skip transcript downloads (videos only)'
     )
     parser.add_argument(
         '--headless',
@@ -572,6 +611,35 @@ def main():
     
     # Main workflow: Extract + Download in one go
     if args.url:
+        # Single video download mode
+        if args.single_video:
+            print("=" * 80)
+            print("🎥 O'REILLY SINGLE VIDEO DOWNLOADER")
+            print("=" * 80)
+            print(f"🔗 URL: {args.url}")
+            
+            downloader = OReillyCourseDownloader(
+                email=args.email,
+                password=args.password,
+                transcript_only=args.transcript_only,
+                headless=args.headless,
+                cookie_file=args.cookie_file,
+                no_transcript=args.no_transcript
+            )
+            
+            try:
+                downloader.setup_driver()
+                if downloader.login():
+                    downloader.process_single_video(args.url)
+                else:
+                    print("❌ Login failed")
+            except Exception as e:
+                print(f"\n❌ Download failed: {e}")
+                traceback.print_exc()
+            finally:
+                downloader.cleanup()
+            return
+
         # Normalize URL: if video URL provided, convert to course URL for better extraction
         # e.g. /videos/slug/id/video_id/ -> /course/slug/id/
         if '/videos/' in args.url:
@@ -624,7 +692,8 @@ def main():
                 password=args.password,
                 transcript_only=args.transcript_only,
                 headless=args.headless,
-                cookie_file=args.cookie_file
+                cookie_file=args.cookie_file,
+                no_transcript=args.no_transcript
             )
             downloader.download_course(
                 course_structure_file=structure_file,

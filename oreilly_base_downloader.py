@@ -46,7 +46,7 @@ class OReillyDownloader:
     LOGIN_URL = f"{BASE_URL}/accounts/login/"
     SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
     
-    def __init__(self, email, password, download_dir="downloads", transcript_only=False, headless=True, cookie_file=None):
+    def __init__(self, email, password, download_dir="downloads", transcript_only=False, headless=True, cookie_file=None, no_transcript=False):
         self.email = email
         self.password = password
         self.cookie_file = cookie_file
@@ -58,6 +58,7 @@ class OReillyDownloader:
         self.driver = None
         self.transcript_only = transcript_only
         self.headless = headless
+        self.no_transcript = no_transcript
         
     def _configure_chrome_options(self):
         """Configure Chrome options for headless automation"""
@@ -280,7 +281,7 @@ class OReillyDownloader:
             const originalFetch = window.fetch;
             window.fetch = function(...args) {
                 const url = typeof args[0] === 'string' ? args[0] : args[0].url;
-                if (url && url.includes('.m3u8')) {
+                if (url && url.includes('.m3u8') && !url.includes('caption') && !url.includes('serveWebVTT')) {
                     window._capturedUrls.push(url);
                 }
                 return originalFetch.apply(this, args);
@@ -289,7 +290,7 @@ class OReillyDownloader:
             // Intercept XHR requests
             const originalXHROpen = XMLHttpRequest.prototype.open;
             XMLHttpRequest.prototype.open = function(method, url) {
-                if (url && url.includes('.m3u8')) {
+                if (url && url.includes('.m3u8') && !url.includes('caption') && !url.includes('serveWebVTT')) {
                     window._capturedUrls.push(url);
                 }
                 return originalXHROpen.apply(this, arguments);
@@ -302,35 +303,63 @@ class OReillyDownloader:
         """Get URLs captured by injected JavaScript"""
         try:
             urls = self.driver.execute_script("return window._capturedUrls || [];")
-            return list(set(urls))  # Remove duplicates
+            # Remove duplicates while preserving order
+            return list(dict.fromkeys(urls))
         except:
             return []
-    
+
     def _get_urls_from_performance_logs(self):
-        """Extract m3u8 URLs from Chrome performance logs"""
+        """Get m3u8 URLs from Chrome performance logs"""
+        urls = []
         try:
             logs = self.driver.get_log('performance')
-            urls = set()
-            
-            for log in logs:
-                try:
-                    message = json.loads(log['message'])
-                    method = message['message']['method']
-                    
-                    if method in ('Network.requestWillBeSent', 'Network.responseReceived'):
-                        params = message['message'].get('params', {})
-                        url = (params.get('request', {}).get('url') or 
-                               params.get('response', {}).get('url'))
-                        
-                        if url and '.m3u8' in url:
-                            urls.add(url)
-                except:
-                    continue
-            
-            return list(urls)
-        except:
-            return []
+            for entry in logs:
+                message = json.loads(entry['message'])['message']
+                if message['method'] == 'Network.requestWillBeSent':
+                    url = message['params']['request']['url']
+                    if '.m3u8' in url and 'caption' not in url and 'serveWebVTT' not in url:
+                        urls.append(url)
+        except Exception as e:
+            # Performance logging might not be enabled or supported
+            pass
+        
+        # Remove duplicates while preserving order
+        return list(dict.fromkeys(urls))
     
+    def _select_best_url(self, urls):
+        """Select the best m3u8 URL (prefer master playlist or highest quality)"""
+        if not urls:
+            return None
+            
+        print(f"    🔎 Analyzing {len(urls)} captured URLs...")
+        
+        # 1. Look for explicit master/manifest keywords
+        # Master playlists usually don't have resolution info in the filename
+        masters = []
+        for u in urls:
+            u_lower = u.lower()
+            if ('master' in u_lower or 'manifest' in u_lower or 'playlist' in u_lower) and \
+               not any(x in u_lower for x in ['_1080', '_720', '_540', '_360', 'kbps']):
+                masters.append(u)
+        
+        if masters:
+            print(f"    🎯 Found candidate master playlist(s): {len(masters)}")
+            # Prefer the one with 'master' in it, or just the first one found
+            return masters[0]
+            
+        # 2. Look for high resolution indicators
+        resolutions = ['1080', '720', '540', '360']
+        for res in resolutions:
+            res_urls = [u for u in urls if res in u]
+            if res_urls:
+                print(f"    🎯 Found {res}p stream")
+                return res_urls[0]
+        
+        # 3. If no obvious master or resolution, prefer the shortest URL
+        # (Master playlists are often cleaner/shorter than segment lists)
+        print("    ⚠️  No clear master/resolution found, using shortest URL")
+        return sorted(urls, key=len)[0]
+
     def capture_video_url(self, video_url, timeout=45, reload_page=True):
         """Navigate to video page and capture m3u8 URL"""
         print(f"\n📹 Processing: {video_url}")
@@ -362,19 +391,37 @@ class OReillyDownloader:
             start_time = time.time()
             check_count = 0
             
+            found_urls = []
+            first_found_time = None
+            collection_window = 3.0  # Wait 3 seconds after first URL to collect others
+            
             while time.time() - start_time < timeout:
                 check_count += 1
                 
                 # Try both capture methods
-                urls = self._get_captured_urls() or self._get_urls_from_performance_logs()
+                current_urls = self._get_captured_urls() or self._get_urls_from_performance_logs()
                 
-                if urls:
-                    print(f"  ✅ Captured URL after {check_count} checks!")
-                    print(f"     {urls[0][:100]}...")
-                    return urls[0]
+                if current_urls:
+                    # Add new URLs while preserving order
+                    for url in current_urls:
+                        if url not in found_urls:
+                            found_urls.append(url)
+                            # Only print last part of URL to avoid clutter
+                            short_url = url.split('?')[0][-40:] if '?' in url else url[-40:]
+                            print(f"    Found URL: ...{short_url}")
+                    
+                    if first_found_time is None:
+                        first_found_time = time.time()
+                        print(f"  ⏳ First URL found, waiting {collection_window}s for others...")
+                
+                # If we found URLs and the collection window has passed
+                if first_found_time and (time.time() - first_found_time > collection_window):
+                    selected_url = self._select_best_url(found_urls)
+                    print(f"  ✅ Selected best URL: ...{selected_url.split('?')[0][-50:]}")
+                    return selected_url
                 
                 # Progress update every 5 seconds
-                if check_count % 5 == 0:
+                if check_count % 5 == 0 and not first_found_time:
                     elapsed = int(time.time() - start_time)
                     print(f"     Still waiting... ({elapsed}s elapsed)")
                 
@@ -563,16 +610,16 @@ class OReillyDownloader:
                 str(output_path)
             ]
             
-            result = self._run_ffmpeg_with_spinner(cmd, output_path)
+            # Run ffmpeg directly to show progress stats
+            print(f"    ⬇️  Downloading... (Check progress below)")
+            result = subprocess.run(cmd)
             
             if result.returncode == 0 and output_path.exists():
                 size_mb = output_path.stat().st_size / (1024 * 1024)
-                print(f"\r    ✅ Downloaded: {output_path.name} ({size_mb:.1f} MB)")
+                print(f"    ✅ Downloaded: {output_path.name} ({size_mb:.1f} MB)")
                 return str(output_path)
             else:
-                print(f"\r    ❌ Download failed")
-                if result.stderr:
-                    print(f"    Error: {result.stderr[:200]}")
+                print(f"    ❌ Download failed")
                 return None
                 
         except Exception as e:
@@ -610,7 +657,7 @@ class OReillyDownloader:
             pass
         return {}
     
-    def process_single_video(self, video_url):
+    def process_single_video(self, video_url, title=None):
         """
         Process a single video: capture URL, extract transcript, download.
         Used internally by OReillyCourseDownloader for course downloads.
@@ -627,12 +674,17 @@ class OReillyDownloader:
         else:
             print(f"\n📹 Processing: {video_url} (Already on page)")
         
-        # Get video title while on video page
-        title = self.get_video_title()
+        # Get video title if not provided
+        if not title:
+            # Get video title while on video page
+            title = self.get_video_title()
+        
         print(f"  ✓ Video title: {title}")
         
         # Extract transcript
-        transcript = self.extract_transcript()
+        transcript = None
+        if not self.no_transcript:
+            transcript = self.extract_transcript()
         
         # Initialize result
         result = {
